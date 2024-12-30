@@ -1,19 +1,19 @@
 # Main requirements
-python-telegram-bot==13.5
-SQLAlchemy==1.4.14
+python-telegram-bot[job-queue]==20.7
+SQLAlchemy==2.0.25
 requests==2.31.0
 toml==0.10.2
 
 # Sub-dependencies
-APScheduler==3.6.3
-certifi==2023.7.22
-chardet==4.0.0
-coloredlogs==15.0
-greenlet==1.1.0
-humanfriendly==9.1
-idna==2.10
-pytz==2021.1
+APScheduler==3.10.4
+certifi==2023.11.17
+chardet==5.2.0
+coloredlogs==15.0.1
+greenlet>=3.0.3
+humanfriendly==10.0
+idna==3.6
+pytz==2023.3.post1
 six==1.16.0
-tornado==6.3.3
-tzlocal==2.1
-urllib3==1.26.18
+tornado==6.4
+tzlocal==5.2
+urllib3==2.1.0
