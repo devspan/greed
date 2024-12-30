@@ -21,22 +21,29 @@ class TableDeclarativeBase(DeclarativeBase):
     pass
 
 class User(TableDeclarativeBase):
-    """A Telegram user who uses the bot"""
+    """A Telegram user who uses the bot."""
     
     __tablename__ = "users"
     
-    # The Telegram user ID
+    # Telegram data
     user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    # The user first name
     first_name: Mapped[str] = mapped_column(String)
-    # The user last name
     last_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    # The user username
     username: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    # Language
-    language: Mapped[str] = mapped_column(String)
+    # Current language
+    language: Mapped[str] = mapped_column(String, default="en")  # Default to English
     # Credit
     credit: Mapped[int] = mapped_column(Integer, default=0)
+    
+    def __init__(self, w=None, **kwargs):
+        super().__init__(**kwargs)
+        if w is not None:
+            self.user_id = w.telegram_user.id
+            self.first_name = w.telegram_user.first_name
+            self.last_name = w.telegram_user.last_name
+            self.username = w.telegram_user.username
+            # Set language from user's Telegram client if available
+            self.language = w.telegram_user.language_code if w.telegram_user.language_code in w.cfg["Language"]["enabled_languages"] else w.cfg["Language"]["default_language"]
     # Extra table parameters
     __table_args__ = (UniqueConstraint("user_id"),)
 

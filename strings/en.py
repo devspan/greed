@@ -432,3 +432,11 @@ error_user_does_not_exist = "⚠️  The selected user does not exist."
 fatal_conversation_exception = "☢️ Oh no! An <b>error</b> interrupted this conversation\n" \
                                "The error was reported to the bot owner so that he can fix it.\n" \
                                "To restart the conversation, send the /start command again."
+
+# Add these to your English strings
+{
+    # ... existing strings ...
+    "error_invalid_command_in_state": "Invalid command for current menu. Please use the menu buttons or /start to reset.",
+    "error_menu_timeout": "Menu session timed out. Please use /start to begin again.",
+    "error_processing_command": "Error processing command. Please try again.",
+}

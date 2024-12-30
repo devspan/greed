@@ -20,6 +20,7 @@ import telegram
 import database as db
 import localization
 import nuconfig
+from utils.menu_state import MenuState, MenuManager
 
 log = logging.getLogger(__name__)
 
@@ -112,6 +113,8 @@ class Worker:
         self.invoice_payload = None
         # The stop reason will be displayed to the user when the worker stops
         self._stop_reason = "unknown"
+        self.menu_manager = MenuManager()
+        self.menu_manager.set_state(MenuState.MAIN)
 
     def __repr__(self):
         return f"<{self.__class__.__qualname__} {self.name}>"
@@ -966,3 +969,62 @@ class Worker:
             )
             # Return to the main menu
             await self.__user_menu()
+
+    async def handle_menu_command(self, command: str) -> bool:
+        """Handle menu commands and return True if handled"""
+        try:
+            if command == self.loc.get("menu_order"):
+                self.menu_manager.set_state(MenuState.ORDER)
+                await self.show_order_menu()
+                return True
+            elif command == self.loc.get("menu_order_status"):
+                self.menu_manager.set_state(MenuState.ORDER_STATUS)
+                await self.show_order_status()
+                return True
+            elif command == self.loc.get("menu_add_credit"):
+                self.menu_manager.set_state(MenuState.ADD_CREDIT)
+                await self.show_add_credit()
+                return True
+            elif command == self.loc.get("menu_language"):
+                self.menu_manager.set_state(MenuState.LANGUAGE)
+                await self.show_language_selection()
+                return True
+            elif command == self.loc.get("menu_help"):
+                self.menu_manager.set_state(MenuState.HELP)
+                await self.show_help()
+                return True
+            elif command == self.loc.get("menu_bot_info"):
+                self.menu_manager.set_state(MenuState.BOT_INFO)
+                await self.show_bot_info()
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error handling menu command: {str(e)}")
+            return False
+
+    async def process_message(self, update: telegram.Update):
+        """Process incoming messages based on current menu state"""
+        try:
+            message_text = update.message.text.strip()
+            
+            # Try to handle as menu command first
+            if await self.handle_menu_command(message_text):
+                return
+
+            # Handle based on current state
+            current_state = self.menu_manager.get_state()
+            if current_state == MenuState.ORDER:
+                await self.handle_order(message_text)
+            elif current_state == MenuState.ADD_CREDIT:
+                await self.handle_add_credit(message_text)
+            elif current_state == MenuState.LANGUAGE:
+                await self.handle_language_selection(message_text)
+            else:
+                # Unknown command in current state
+                await self.send_message(
+                    self.loc.get("error_invalid_command_in_state"),
+                    reply_markup=self.create_main_menu()
+                )
+        except Exception as e:
+            logger.error(f"Error processing message: {str(e)}")
+            await self.send_error_message()

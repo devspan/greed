@@ -1,6 +1,7 @@
 import logging
 import sys
 import os
+import signal
 import traceback
 import nuconfig
 import database as db
@@ -13,15 +14,11 @@ from typing import Dict
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 import localization
-import signal
+from dotenv import load_dotenv
+from utils.logger import log_error, log_command, log_callback, logger
+from middleware.menu_handler import ensure_menu_state
 
-def signal_handler(sig, frame):
-    print('\nShutting down gracefully...')
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-
-# Enable detailed logging
+# Enable detailed logging first
 logging.basicConfig(
     format="{asctime} | {threadName} | {name} | {levelname} | {message}",
     style='{',
@@ -32,13 +29,26 @@ logging.basicConfig(
     ]
 )
 
+# Create logger
 log = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+log.debug(f"Bot token from env: {os.getenv('TELEGRAM_BOT_TOKEN')}")
+
+def signal_handler(sig, frame):
+    print('\nShutting down gracefully...')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
 
 # Global variables
 chat_workers: Dict[int, worker.Worker] = {}
 user_cfg = None
 engine = None
 
+@log_command
+@log_error
 async def start_command(update: telegram.Update, context):
     """Handler for /start command"""
     try:
@@ -49,12 +59,12 @@ async def start_command(update: telegram.Update, context):
         chat_id = update.message.chat_id
         log.info(f"Received /start from: {chat_id}")
         
-        # Check if a worker already exists for that chat
+        # Stop existing worker if any
         old_worker = chat_workers.get(chat_id)
-        # If it exists, gracefully stop the worker
         if old_worker:
-            log.debug(f"Received request to stop {old_worker.name}")
+            log.debug(f"Stopping existing worker: {old_worker.name}")
             old_worker.stop("request")
+            del chat_workers[chat_id]  # Remove old worker
 
         # Initialize a new worker for the chat
         new_worker = worker.Worker(
@@ -66,12 +76,28 @@ async def start_command(update: telegram.Update, context):
             daemon=True
         )
         
+        # Get or create user with proper language
+        with Session(engine) as session:
+            user = session.query(db.User).filter(db.User.user_id == chat_id).first()
+            if not user:
+                # New user - create with proper language
+                user = db.User(
+                    user_id=chat_id,
+                    first_name=update.message.from_user.first_name,
+                    last_name=update.message.from_user.last_name,
+                    username=update.message.from_user.username,
+                    language=update.message.from_user.language_code if update.message.from_user.language_code in user_cfg["Language"]["enabled_languages"] else user_cfg["Language"]["default_language"]
+                )
+                session.add(user)
+                session.commit()
+
         # Start the worker
         log.debug(f"Starting {new_worker.name}")
         await new_worker.start()
         
         # Store the worker in the dictionary
         chat_workers[chat_id] = new_worker
+
     except Exception as e:
         log.error(f"Error in start_command: {str(e)}")
         log.error(traceback.format_exc())
@@ -81,8 +107,11 @@ async def start_command(update: telegram.Update, context):
             pass
         raise
 
+@ensure_menu_state
+@log_command
+@log_error
 async def message_handler(update: telegram.Update, context):
-    """Handler for all non-command messages"""
+    """Handler for text messages"""
     try:
         chat_id = update.message.chat_id
         log.debug(f"Received message from {chat_id}: {update.message.text[:20]}...")
@@ -126,10 +155,16 @@ async def message_handler(update: telegram.Update, context):
             pass
         raise
 
+@log_callback
+@log_error
 async def callback_query_handler(update: telegram.Update, context):
     """Handler for inline keyboard callbacks"""
     try:
         if not update.callback_query:
+            return
+
+        # Check if this is a language selection callback
+        if await handle_language_selection(update, context):
             return
 
         log.debug(f"Received callback query: {update.callback_query.data}")
@@ -203,11 +238,82 @@ async def error_handler(update: telegram.Update, context):
     except:
         pass
 
+@log_callback
+@log_error
+async def handle_language_selection(update: telegram.Update, context):
+    """Handle language selection callback"""
+    query = update.callback_query
+    if not query.data.startswith("lang_"):
+        return False
+        
+    try:
+        lang_code = query.data.split("_")[1]
+        if lang_code not in context.bot_data["supported_languages"]:
+            await query.answer("Invalid language selection")
+            return True
+
+        chat_id = query.from_user.id
+        
+        # Update user language in database
+        with Session(engine) as session:
+            user = session.query(db.User).filter(db.User.user_id == chat_id).first()
+            if not user:
+                user = db.User(user_id=chat_id, language=lang_code)
+                session.add(user)
+            else:
+                user.language = lang_code
+            session.commit()
+
+        # Confirm language change
+        lang_name = context.bot_data["supported_languages"][lang_code]
+        await query.message.edit_text(f"Language set to {lang_name}")
+        
+        # Start new worker with selected language
+        await start_command(update, context)
+        
+        return True
+    except Exception as e:
+        log.error(f"Error handling language selection: {str(e)}")
+        await query.answer("Error setting language. Please try again.")
+        return True
+
+@log_command
+@log_error
+async def language_command(update: telegram.Update, context):
+    """Handler for /language command"""
+    try:
+        chat_id = update.message.chat_id
+        keyboard = []
+        for lang_code in user_cfg["Language"]["enabled_languages"]:
+            keyboard.append([telegram.InlineKeyboardButton(
+                context.bot_data["supported_languages"].get(lang_code, lang_code),
+                callback_data=f"lang_{lang_code}"
+            )])
+        
+        reply_markup = telegram.InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "Please select your language / Seleziona la tua lingua:",
+            reply_markup=reply_markup
+        )
+    except Exception as e:
+        log.error(f"Error in language_command: {str(e)}")
+        log.error(traceback.format_exc())
+        await update.message.reply_text("Error changing language. Please try again.")
+
 def main():
     """Start the bot."""
     global user_cfg, engine
 
     try:
+        # Load environment variables first
+        load_dotenv()
+        
+        # Get bot token from environment or fail
+        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not bot_token:
+            log.fatal("TELEGRAM_BOT_TOKEN not found in environment variables!")
+            sys.exit(1)
+            
         # Load config
         log.debug("Loading config file...")
         config_path = os.environ.get("CONFIG_PATH", "config/config.toml")
@@ -236,28 +342,49 @@ def main():
         log.debug("Creating the sqlalchemy engine...")
         db_engine = os.environ.get("DB_ENGINE", user_cfg["Database"]["engine"])
         log.debug(f"Using database engine: {db_engine}")
-        engine = create_engine(db_engine, echo=True)  # Enable SQL query logging
-
+        engine = create_engine(db_engine, echo=True)
+        
         # Create all tables
         log.debug("Creating all missing tables...")
         db.TableDeclarativeBase.metadata.create_all(engine)
+        
+        # Set logging level from environment
+        log_level = os.environ.get("LOG_LEVEL", "INFO")
+        logging.basicConfig(
+            format=os.environ.get("LOG_FORMAT", "{asctime} | {threadName} | {name} | {levelname} | {message}"),
+            style='{',
+            level=getattr(logging, log_level),
+            handlers=[
+                logging.StreamHandler(),
+                logging.FileHandler('bot.log')
+            ]
+        )
 
-        # Create the application and pass it your bot's token
-        token = user_cfg["Telegram"]["token"]
-        if not token:
-            log.fatal("No bot token found in config file!")
-            sys.exit(1)
-            
+        # Create the application with token directly from environment
         log.debug("Creating Telegram application...")
-        application = Application.builder().token(token).build()
+        application = Application.builder().token(bot_token).build()
 
         # Default localization
-        default_language = user_cfg["Language"]["default_language"]
+        default_language = user_cfg["Language"].get("default_language", "en")  # Fallback to English if not specified
         log.debug(f"Setting up localization with default language: {default_language}")
         application.bot_data["default_loc"] = localization.Localization(
             language=default_language,
-            fallback=default_language
+            fallback="en"  # Always use English as fallback
         )
+
+        # Add this after creating the application
+        # Store supported languages in bot_data for easy access
+        application.bot_data["supported_languages"] = {
+            "en": "English",
+            "it": "Italiano",
+            "es": "Español",
+            "ru": "Русский",
+            "uk": "Українська",
+            "zh": "中文",
+            "hi": "हिन्दी",
+            "pt": "Português",
+            "he": "עברית"
+        }
 
         # Add handlers
         log.debug("Adding command handlers...")
@@ -268,6 +395,7 @@ def main():
         ))
         application.add_handler(CallbackQueryHandler(callback_query_handler))
         application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+        application.add_handler(CommandHandler("language", language_command))
 
         # Add error handler
         application.add_error_handler(error_handler)
