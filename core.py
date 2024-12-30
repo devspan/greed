@@ -9,7 +9,6 @@ import telegram
 from telegram import error as telegram_error
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters
 import worker
-import threading
 from typing import Dict
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -17,6 +16,10 @@ import localization
 from dotenv import load_dotenv
 from utils.logger import log_error, log_command, log_callback, logger
 from middleware.menu_handler import ensure_menu_state
+from menus.menu_state import MenuState
+import asyncio
+from contextlib import suppress
+from utils.env_loader import validate_env_file
 
 # Enable detailed logging first
 logging.basicConfig(
@@ -52,59 +55,38 @@ engine = None
 async def start_command(update: telegram.Update, context):
     """Handler for /start command"""
     try:
-        if not update.message or not update.message.chat or update.message.chat.type != "private":
-            await update.message.reply_text(context.bot_data["default_loc"].get("error_nonprivate_chat"))
-            return
-
-        chat_id = update.message.chat_id
-        log.info(f"Received /start from: {chat_id}")
-        
-        # Stop existing worker if any
-        old_worker = chat_workers.get(chat_id)
-        if old_worker:
-            log.debug(f"Stopping existing worker: {old_worker.name}")
-            old_worker.stop("request")
-            del chat_workers[chat_id]  # Remove old worker
-
-        # Initialize a new worker for the chat
+        # Cleanup old worker if exists
+        if 'worker' in context.chat_data:
+            old_worker = context.chat_data['worker']
+            old_worker.cleanup()
+            
+        # Create and initialize worker
         new_worker = worker.Worker(
             bot=context.bot,
             chat=update.message.chat,
             telegram_user=update.message.from_user,
-            cfg=user_cfg,
-            engine=engine,
-            daemon=True
+            cfg=context.bot_data['config'],
+            engine=context.bot_data['engine']
         )
         
-        # Get or create user with proper language
-        with Session(engine) as session:
-            user = session.query(db.User).filter(db.User.user_id == chat_id).first()
-            if not user:
-                # New user - create with proper language
-                user = db.User(
-                    user_id=chat_id,
-                    first_name=update.message.from_user.first_name,
-                    last_name=update.message.from_user.last_name,
-                    username=update.message.from_user.username,
-                    language=update.message.from_user.language_code if update.message.from_user.language_code in user_cfg["Language"]["enabled_languages"] else user_cfg["Language"]["default_language"]
-                )
-                session.add(user)
-                session.commit()
-
-        # Start the worker
-        log.debug(f"Starting {new_worker.name}")
-        await new_worker.start()
+        # Store worker in chat_data
+        context.chat_data['worker'] = new_worker
         
-        # Store the worker in the dictionary
-        chat_workers[chat_id] = new_worker
+        # Check if worker is ready
+        if not new_worker.is_ready():
+            await update.message.reply_text(
+                context.bot_data["default_loc"].get("error_worker_not_ready")
+            )
+            return
+            
+        # Start the worker and show main menu
+        await new_worker.start()
 
     except Exception as e:
-        log.error(f"Error in start_command: {str(e)}")
-        log.error(traceback.format_exc())
-        try:
-            await update.message.reply_text("An error occurred while starting the bot. Please try again later.")
-        except:
-            pass
+        logger.error(f"Error in start_command: {str(e)}")
+        await update.message.reply_text(
+            "An error occurred while starting the bot. Please try again later."
+        )
         raise
 
 @ensure_menu_state
@@ -158,39 +140,40 @@ async def message_handler(update: telegram.Update, context):
 @log_callback
 @log_error
 async def callback_query_handler(update: telegram.Update, context):
-    """Handler for inline keyboard callbacks"""
+    """Handle callback queries from inline keyboards"""
+    query = update.callback_query
     try:
-        if not update.callback_query:
-            return
-
-        # Check if this is a language selection callback
-        if await handle_language_selection(update, context):
-            return
-
-        log.debug(f"Received callback query: {update.callback_query.data}")
-        receiving_worker = chat_workers.get(update.callback_query.from_user.id)
+        # Get or create worker
+        chat_id = update.effective_chat.id
+        worker = context.chat_data.get('worker')
         
-        if receiving_worker is None:
-            await update.callback_query.message.reply_text(
-                context.bot_data["default_loc"].get("error_no_worker_for_chat")
-            )
+        if not worker:
+            await query.answer("Session expired. Please use /start to begin again.")
             return
 
-        if update.callback_query.data == "cmd_cancel":
-            log.debug(f"Forwarding CancelSignal to {receiving_worker}")
-            receiving_worker.queue.put(worker.CancelSignal())
-            await update.callback_query.answer()
+        # Map callback data to menu states and handlers
+        callback_map = {
+            "order": (MenuState.ORDER, worker.show_order_menu),
+            "order_status": (MenuState.ORDER_STATUS, worker.show_order_status),
+            "add_credit": (MenuState.ADD_CREDIT, worker.show_add_credit),
+            "language": (MenuState.LANGUAGE, worker.show_language_selection),
+            "help": (MenuState.HELP, worker.show_help),
+            "bot_info": (MenuState.BOT_INFO, worker.show_bot_info),
+            "back": (MenuState.MAIN, worker.show_menu)
+        }
+
+        if query.data in callback_map:
+            state, handler = callback_map[query.data]
+            worker.menu_manager.set_state(state)
+            await handler()
+            await query.answer()
         else:
-            log.debug(f"Forwarding callback query to {receiving_worker}")
-            receiving_worker.queue.put(update)
+            await query.answer("Invalid option")
+            logger.warning(f"Unhandled callback data: {query.data}")
+
     except Exception as e:
-        log.error(f"Error in callback_query_handler: {str(e)}")
-        log.error(traceback.format_exc())
-        try:
-            await update.callback_query.answer("An error occurred. Please try again.")
-        except:
-            pass
-        raise
+        logger.error(f"Error handling callback query: {str(e)}")
+        await query.answer("An error occurred. Please try again.")
 
 async def pre_checkout_handler(update: telegram.Update, context):
     """Handler for pre-checkout queries"""
@@ -300,114 +283,158 @@ async def language_command(update: telegram.Update, context):
         log.error(traceback.format_exc())
         await update.message.reply_text("Error changing language. Please try again.")
 
-def main():
-    """Start the bot."""
-    global user_cfg, engine
-
-    try:
-        # Load environment variables first
-        load_dotenv()
+class BotApplication:
+    def __init__(self):
+        self.app = None
+        self.bot_token = None
+        self.config = None
+        self.engine = None
+        self._shutdown_event = asyncio.Event()
         
-        # Get bot token from environment or fail
-        bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if not bot_token:
-            log.fatal("TELEGRAM_BOT_TOKEN not found in environment variables!")
-            sys.exit(1)
-            
-        # Load config
-        log.debug("Loading config file...")
-        config_path = os.environ.get("CONFIG_PATH", "config/config.toml")
-        
-        # If the config file does not exist, clone the template and exit
-        if not os.path.isfile(config_path):
-            log.debug("config/config.toml does not exist.")
-            template_path = "config/template_config.toml"
-            if not os.path.isfile(template_path):
-                log.fatal(f"Template config file not found at {template_path}")
+    async def initialize(self):
+        """Initialize bot configuration and database"""
+        try:
+            # Load environment variables
+            env_vars = validate_env_file()
+            if not env_vars:
                 sys.exit(1)
                 
-            os.makedirs(os.path.dirname(config_path), exist_ok=True)
-            with open(template_path, encoding="utf8") as template_cfg_file, \
-                    open(config_path, "w", encoding="utf8") as user_cfg_file:
-                user_cfg_file.write(template_cfg_file.read())
-            log.fatal("A config file has been created. Customize it, then restart greed!")
-            sys.exit(1)
+            # Get bot token and ensure it's clean
+            self.bot_token = env_vars['TELEGRAM_BOT_TOKEN'].strip().strip('"\'')
+            if not self.bot_token or self.bot_token == "your-bot-token-here":
+                logger.critical("Invalid bot token! Please set a valid token in .env file")
+                sys.exit(1)
+                
+            logger.debug("Successfully loaded configuration from .env file")
+            
+            # Load config file
+            logger.debug("Loading config file...")
+            logger.debug("Reading config from config/config.toml")
+            self.config = nuconfig.NuConfig("config/config.toml")
+            
+            # Initialize database with best practices
+            logger.debug("Creating the sqlalchemy engine...")
+            db_url = env_vars.get('DB_ENGINE', 'sqlite:///database.sqlite')
+            # Remove any extra quotes
+            db_url = db_url.strip('"\'')
+            
+            # Create engine with recommended settings
+            self.engine = create_engine(
+                db_url,
+                # Enable connection pooling
+                pool_pre_ping=True,  # Enable connection health checks
+                pool_recycle=3600,   # Recycle connections after 1 hour
+                # SQLite specific optimizations
+                connect_args={'check_same_thread': False} if db_url.startswith('sqlite') else {},
+                echo=False,  # Set to True for SQL query logging
+                future=True  # Use SQLAlchemy 2.0 style
+            )
+            
+            # Create tables
+            logger.debug("Creating all missing tables...")
+            db.Base.metadata.create_all(self.engine)
+            
+            # Create the bot
+            self.app = Application.builder().token(self.bot_token).build()
+            
+            # Add handlers
+            self.app.add_handler(CommandHandler("start", start_command))
+            self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+            self.app.add_handler(CallbackQueryHandler(callback_query_handler))
+            
+            # Store common data
+            self.app.bot_data["config"] = self.config
+            self.app.bot_data["engine"] = self.engine
+            
+        except Exception as e:
+            logger.error(f"Error during initialization: {str(e)}")
+            raise
 
-        # Load and validate the config
-        log.debug(f"Reading config from {config_path}")
-        with open(config_path, encoding="utf8") as cfg_file:
-            user_cfg = nuconfig.NuConfig(cfg_file)
+    async def run(self):
+        """Run the bot application"""
+        try:
+            await self.initialize()
+            logger.info("Starting bot...")
+            
+            # Initialize and start the application
+            await self.app.initialize()
+            await self.app.start()
+            
+            # Start polling in the background
+            polling_task = asyncio.create_task(
+                self.app.updater.start_polling(
+                    allowed_updates=telegram.Update.ALL_TYPES,
+                    drop_pending_updates=True
+                )
+            )
+            
+            # Wait for shutdown signal
+            await self._shutdown_event.wait()
+            
+            # Cancel polling and cleanup
+            polling_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await polling_task
+                
+        except Exception as e:
+            logger.error(f"Error starting bot: {str(e)}")
+            raise
+        finally:
+            await self.shutdown()
 
-        # Create the database engine
-        log.debug("Creating the sqlalchemy engine...")
-        db_engine = os.environ.get("DB_ENGINE", user_cfg["Database"]["engine"])
-        log.debug(f"Using database engine: {db_engine}")
-        engine = create_engine(db_engine, echo=True)
+    async def shutdown(self):
+        """Shutdown the bot application"""
+        try:
+            logger.info("Stopping bot application...")
+            if self.app and self.app.running:
+                await self.app.stop()
+                await self.app.shutdown()
+            if self.engine:
+                self.engine.dispose()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {str(e)}")
+
+def main():
+    """Main entry point"""
+    bot = BotApplication()
+    
+    def signal_handler():
+        """Handle shutdown signals"""
+        if not bot._shutdown_event.is_set():
+            logger.info("Received shutdown signal")
+            asyncio.get_event_loop().call_soon_threadsafe(
+                bot._shutdown_event.set
+            )
+    
+    try:
+        # Setup signal handlers
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         
-        # Create all tables
-        log.debug("Creating all missing tables...")
-        db.TableDeclarativeBase.metadata.create_all(engine)
-        
-        # Set logging level from environment
-        log_level = os.environ.get("LOG_LEVEL", "INFO")
-        logging.basicConfig(
-            format=os.environ.get("LOG_FORMAT", "{asctime} | {threadName} | {name} | {levelname} | {message}"),
-            style='{',
-            level=getattr(logging, log_level),
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('bot.log')
-            ]
-        )
-
-        # Create the application with token directly from environment
-        log.debug("Creating Telegram application...")
-        application = Application.builder().token(bot_token).build()
-
-        # Default localization
-        default_language = user_cfg["Language"].get("default_language", "en")  # Fallback to English if not specified
-        log.debug(f"Setting up localization with default language: {default_language}")
-        application.bot_data["default_loc"] = localization.Localization(
-            language=default_language,
-            fallback="en"  # Always use English as fallback
-        )
-
-        # Add this after creating the application
-        # Store supported languages in bot_data for easy access
-        application.bot_data["supported_languages"] = {
-            "en": "English",
-            "it": "Italiano",
-            "es": "Español",
-            "ru": "Русский",
-            "uk": "Українська",
-            "zh": "中文",
-            "hi": "हिन्दी",
-            "pt": "Português",
-            "he": "עברית"
-        }
-
-        # Add handlers
-        log.debug("Adding command handlers...")
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
-            message_handler
-        ))
-        application.add_handler(CallbackQueryHandler(callback_query_handler))
-        application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
-        application.add_handler(CommandHandler("language", language_command))
-
-        # Add error handler
-        application.add_error_handler(error_handler)
-
-        # Start the Bot
-        log.info("Starting bot...")
-        application.run_polling(allowed_updates=telegram.Update.ALL_TYPES)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, signal_handler)
+            
+        # Run bot until complete
+        loop.run_until_complete(bot.run())
         
     except Exception as e:
-        log.error(f"Fatal error in main: {str(e)}")
-        log.error(traceback.format_exc())
-        sys.exit(1)
+        logger.error(f"Fatal error: {str(e)}")
+    finally:
+        try:
+            # Clean shutdown
+            tasks = [t for t in asyncio.all_tasks(loop) 
+                    if t is not asyncio.current_task()]
+            
+            for task in tasks:
+                task.cancel()
+                
+            loop.run_until_complete(
+                asyncio.gather(*tasks, return_exceptions=True)
+            )
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
 
 if __name__ == "__main__":
     main()

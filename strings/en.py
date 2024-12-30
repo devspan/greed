@@ -439,4 +439,7 @@ fatal_conversation_exception = "☢️ Oh no! An <b>error</b> interrupted this c
     "error_invalid_command_in_state": "Invalid command for current menu. Please use the menu buttons or /start to reset.",
     "error_menu_timeout": "Menu session timed out. Please use /start to begin again.",
     "error_processing_command": "Error processing command. Please try again.",
+    "error_no_env_file": "No .env file found! A template has been created - please edit it with your settings.",
+    "error_invalid_token": "Invalid bot token! Please check your TELEGRAM_BOT_TOKEN in .env file.",
+    "error_missing_env_vars": "Missing required environment variables. Please check your .env file.",
 }

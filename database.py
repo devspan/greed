@@ -6,7 +6,9 @@ import uuid
 import requests
 import telegram
 from sqlalchemy import ForeignKey, UniqueConstraint, Integer, BigInteger, String, Text, LargeBinary, DateTime, Boolean
-from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column, relationship, backref
+from sqlalchemy.orm import Session, DeclarativeBase, Mapped, mapped_column, relationship, backref, declarative_base, sessionmaker
+from sqlalchemy.engine import Engine
+from contextlib import contextmanager
 from datetime import datetime
 
 import utils
@@ -144,3 +146,32 @@ class Admin(TableDeclarativeBase):
     display_on_help: Mapped[bool] = mapped_column(Boolean, default=False)
     is_owner: Mapped[bool] = mapped_column(Boolean, default=False)
     live_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+
+Base = declarative_base()
+
+class DatabaseManager:
+    def __init__(self, engine):
+        self.engine = engine
+        self.Session = sessionmaker(bind=engine)
+
+    def create_session(self):
+        """Create a new session"""
+        return self.Session()
+
+    @contextmanager
+    def session_scope(self):
+        """Provide a transactional scope around a series of operations."""
+        session = self.Session()
+        try:
+            yield session
+            session.commit()
+        except:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def cleanup(self):
+        """Cleanup database resources"""
+        if self.engine:
+            self.engine.dispose()
